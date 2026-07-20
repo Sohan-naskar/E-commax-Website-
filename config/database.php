@@ -4,7 +4,7 @@
 $host = 'localhost';
 $db_name = 'ecommerce_db';
 $username = 'root';
-$password = '12345';
+$password = '';
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$db_name", $username, $password);

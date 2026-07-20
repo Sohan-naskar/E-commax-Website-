@@ -52,7 +52,7 @@ $error = '';
 
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $identifier = trim($_POST['username']);
-    $password = trim($_POST['password']);
+    $password = $_POST['password']; // Do NOT trim password — spaces may be intentional
 
     if (empty($identifier) || empty($password)) {
         $error = "Please enter your email/username and password.";
@@ -61,8 +61,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $stmt = $pdo->prepare("SELECT id, username, password FROM admins WHERE username = ?");
         $stmt->execute([$identifier]);
         $admin = $stmt->fetch();
+        $admin_found = ($admin !== false);
 
-        if ($admin && password_verify($password, $admin['password'])) {
+        if ($admin_found && password_verify($password, $admin['password'])) {
             // It's an Admin
             $_SESSION['admin_id'] = $admin['id'];
             $_SESSION['admin_name'] = $admin['username'];
@@ -72,8 +73,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             exit();
         }
 
-        // 2. Check if CUSTOMER second
-        if (!$admin) {
+        // 2. Check if CUSTOMER second (always check, even if admin username matched)
+        if (!$admin_found) {
             $stmt = $pdo->prepare("SELECT id, name, email, password FROM customers WHERE email = ?");
             $stmt->execute([$identifier]);
             $user = $stmt->fetch();
@@ -108,8 +109,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 exit();
 
             } else {
-                $error = "Invalid credentials.";
+                $error = "Invalid email or password.";
             }
+        } else {
+            // Admin username matched but password was wrong
+            $error = "Invalid username or password.";
         }
     }
 }
@@ -300,6 +304,32 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             box-shadow: 0 0 0 4px rgba(66, 0, 255, 0.1);
             border-color: #4200FF;
             background: #fff;
+        }
+
+        /* Eye toggle */
+        .password-wrapper {
+            position: relative;
+        }
+        .password-wrapper .form-control {
+            padding-right: 48px;
+        }
+        .toggle-password {
+            position: absolute;
+            top: 50%;
+            right: 14px;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            color: #aaa;
+            font-size: 1.2rem;
+            line-height: 1;
+            transition: color 0.2s;
+            z-index: 5;
+        }
+        .toggle-password:hover {
+            color: #4200FF;
         }
 
         .forgot-link {
@@ -496,8 +526,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             </div>
             <div class="mb-2">
                 <label for="password" class="visually-hidden">Password</label>
-                <input type="password" id="password" name="password" class="form-control" placeholder="Password"
-                    required autocomplete="current-password">
+                <div class="password-wrapper">
+                    <input type="password" id="password" name="password" class="form-control" placeholder="Password"
+                        required autocomplete="current-password">
+                    <button type="button" class="toggle-password" onclick="togglePassword('password', this)" aria-label="Show/hide password">
+                        <i class="bi bi-eye"></i>
+                    </button>
+                </div>
             </div>
 
             <a href="forgot_password.php" class="forgot-link">Forgot Email or Password?</a>
@@ -508,6 +543,17 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         </form>
 
         <script>
+            function togglePassword(fieldId, btn) {
+                const input = document.getElementById(fieldId);
+                const icon = btn.querySelector('i');
+                if (input.type === 'password') {
+                    input.type = 'text';
+                    icon.classList.replace('bi-eye', 'bi-eye-slash');
+                } else {
+                    input.type = 'password';
+                    icon.classList.replace('bi-eye-slash', 'bi-eye');
+                }
+            }
             window.onload = function () {
                 const passwordInput = document.getElementById('password');
                 if (passwordInput) {

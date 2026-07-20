@@ -18,17 +18,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $admin = $stmt->fetch();
 
             if ($admin) {
-                $_SESSION['reset_id'] = $admin['id'];
+                $_SESSION['reset_id']   = $admin['id'];
                 $_SESSION['reset_role'] = 'admin';
                 $step = 2;
             } else {
-                // Check Customer
+                // Check Customer by email
                 $stmt = $pdo->prepare("SELECT id FROM customers WHERE email = ?");
                 $stmt->execute([$identifier]);
                 $customer = $stmt->fetch();
 
                 if ($customer) {
-                    $_SESSION['reset_id'] = $customer['id'];
+                    $_SESSION['reset_id']   = $customer['id'];
                     $_SESSION['reset_role'] = 'customer';
                     $step = 2;
                 } else {
@@ -36,35 +36,58 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 }
             }
         }
+
     } elseif (isset($_POST['reset_password'])) {
-        $new_password = $_POST['new_password'];
-        $confirm_password = $_POST['confirm_password'];
 
-        if (empty($new_password) || empty($confirm_password)) {
-            $error = "Please enter and confirm your new password.";
-            $step = 2;
-        } elseif ($new_password !== $confirm_password) {
-            $error = "Passwords do not match.";
-            $step = 2;
+        // Guard: session must be set
+        if (empty($_SESSION['reset_id']) || empty($_SESSION['reset_role'])) {
+            $error = "Session expired. Please start again.";
+            $step  = 1;
         } else {
-            $hashed_password = password_hash($new_password, PASSWORD_DEFAULT);
-            $reset_id = $_SESSION['reset_id'];
-            $reset_role = $_SESSION['reset_role'];
+            $new_password     = $_POST['new_password'];
+            $confirm_password = $_POST['confirm_password'];
 
-            if ($reset_role === 'admin') {
-                $stmt = $pdo->prepare("UPDATE admins SET password = ? WHERE id = ?");
-                $stmt->execute([$hashed_password, $reset_id]);
+            if (empty($new_password) || empty($confirm_password)) {
+                $error = "Please enter and confirm your new password.";
+                $step  = 2;
+            } elseif (strlen($new_password) < 6) {
+                $error = "Password must be at least 6 characters.";
+                $step  = 2;
+            } elseif ($new_password !== $confirm_password) {
+                $error = "Passwords do not match.";
+                $step  = 2;
             } else {
-                $stmt = $pdo->prepare("UPDATE customers SET password = ? WHERE id = ?");
-                $stmt->execute([$hashed_password, $reset_id]);
-            }
+                $hashed_password = password_hash($new_password, PASSWORD_DEFAULT);
+                $reset_id        = $_SESSION['reset_id'];
+                $reset_role      = $_SESSION['reset_role'];
 
-            unset($_SESSION['reset_id']);
-            unset($_SESSION['reset_role']);
-            $success = "Password reset successfully. You can now log in.";
-            $step = 3;
+                if ($reset_role === 'admin') {
+                    $stmt = $pdo->prepare("UPDATE admins SET password = ? WHERE id = ?");
+                } else {
+                    $stmt = $pdo->prepare("UPDATE customers SET password = ? WHERE id = ?");
+                }
+
+                $stmt->execute([$hashed_password, $reset_id]);
+
+                if ($stmt->rowCount() > 0) {
+                    // Success — clean up session
+                    unset($_SESSION['reset_id']);
+                    unset($_SESSION['reset_role']);
+                    $success = "Password reset successfully! You can now log in with your new password.";
+                    $step = 3;
+                } else {
+                    // UPDATE ran but nothing changed (wrong id?)
+                    $error = "Could not update password. Please try again.";
+                    $step  = 2;
+                }
+            }
         }
     }
+}
+
+// Keep step=2 alive across POST if we're still in the reset form
+if ($step === 1 && !empty($_SESSION['reset_id'])) {
+    $step = 2;
 }
 ?>
 <!DOCTYPE html>
@@ -77,6 +100,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     <link rel="icon" href="assets/images/favicon-removebg-preview.png" type="image/png">
     <!-- Bootstrap 5 -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
     <!-- Custom CSS Base -->
     <style>
         body {
@@ -221,6 +246,31 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             color: #4200FF;
             text-decoration: underline;
         }
+        /* Eye toggle wrapper */
+        .password-wrapper {
+            position: relative;
+        }
+        .password-wrapper .form-control {
+            padding-right: 48px;
+        }
+        .toggle-password {
+            position: absolute;
+            top: 50%;
+            right: 14px;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            color: #aaa;
+            font-size: 1.2rem;
+            line-height: 1;
+            transition: color 0.2s;
+            z-index: 5;
+        }
+        .toggle-password:hover {
+            color: #4200FF;
+        }
     </style>
 </head>
 <body>
@@ -280,11 +330,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     <input type="hidden" name="reset_password" value="1">
                     <div class="mb-3">
                         <label for="new_password" class="visually-hidden">New Password</label>
-                        <input type="password" id="new_password" name="new_password" class="form-control" placeholder="New Password" required autofocus>
+                        <div class="password-wrapper">
+                            <input type="password" id="new_password" name="new_password" class="form-control" placeholder="New Password" required autofocus>
+                            <button type="button" class="toggle-password" onclick="togglePassword('new_password', this)" aria-label="Show/hide password">
+                                <i class="bi bi-eye"></i>
+                            </button>
+                        </div>
                     </div>
                     <div class="mb-3">
                         <label for="confirm_password" class="visually-hidden">Confirm Password</label>
-                        <input type="password" id="confirm_password" name="confirm_password" class="form-control" placeholder="Confirm Password" required>
+                        <div class="password-wrapper">
+                            <input type="password" id="confirm_password" name="confirm_password" class="form-control" placeholder="Confirm Password" required>
+                            <button type="button" class="toggle-password" onclick="togglePassword('confirm_password', this)" aria-label="Show/hide confirm password">
+                                <i class="bi bi-eye"></i>
+                            </button>
+                        </div>
                     </div>
                     <button type="submit" class="btn btn-continue">Reset Password</button>
                     <a href="login.php" class="back-link">Cancel</a>
@@ -293,5 +353,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
         <?php endif; ?>
     </div>
+<script>
+    function togglePassword(fieldId, btn) {
+        const input = document.getElementById(fieldId);
+        const icon = btn.querySelector('i');
+        if (input.type === 'password') {
+            input.type = 'text';
+            icon.classList.replace('bi-eye', 'bi-eye-slash');
+        } else {
+            input.type = 'password';
+            icon.classList.replace('bi-eye-slash', 'bi-eye');
+        }
+    }
+</script>
 </body>
 </html>

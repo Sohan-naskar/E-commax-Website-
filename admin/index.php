@@ -103,63 +103,74 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['update_order_status'])
     $order_id = $_POST['order_id'];
     $new_status = $_POST['new_status'];
 
+    // Whitelist allowed statuses
+    $allowed = ['pending','paid','unpaid','shipped','out_for_delivery','delivered','cancelled','refund_processing'];
+    if (!in_array($new_status, $allowed)) {
+        $error = "Invalid status value.";
+    } else {
     try {
         $pdo->beginTransaction();
 
         // 1. Update main order status
-        // Handle "refund_processing" -> Status: Cancelled, Payment: Paid
         if ($new_status == 'refund_processing') {
+            // Cancelled + was paid → refund
             $stmt = $pdo->prepare("UPDATE orders SET status = 'cancelled', payment_status = 'paid' WHERE id = ?");
             $stmt->execute([$order_id]);
-            $is_cancelled_action = true; // Flag for item update
-        }
-        // Handle "cancelled" -> Status: Cancelled, Payment: Unpaid
-        elseif ($new_status == 'cancelled') {
+            $is_cancelled_action = true;
+        } elseif ($new_status == 'cancelled') {
             $stmt = $pdo->prepare("UPDATE orders SET status = 'cancelled', payment_status = 'unpaid' WHERE id = ?");
             $stmt->execute([$order_id]);
-            $is_cancelled_action = true; // Flag for item update
-        }
-        // Handle Standard Statuses
-        else {
+            $is_cancelled_action = true;
+        } elseif ($new_status == 'shipped') {
+            $stmt = $pdo->prepare("UPDATE orders SET status = 'shipped', payment_status = 'paid', shipped_at = NOW() WHERE id = ?");
+            $stmt->execute([$order_id]);
+            $is_cancelled_action = false;
+        } elseif ($new_status == 'delivered') {
+            $stmt = $pdo->prepare("UPDATE orders SET status = 'delivered', payment_status = 'paid', delivered_at = NOW() WHERE id = ?");
+            $stmt->execute([$order_id]);
+            $is_cancelled_action = false;
+        } else {
             $stmt = $pdo->prepare("UPDATE orders SET status = ? WHERE id = ?");
             $stmt->execute([$new_status, $order_id]);
             $is_cancelled_action = false;
         }
 
-        // 2. Sync Payment Status: If shipped/delivered/paid, it must be 'paid'
-        if (in_array($new_status, ['shipped', 'delivered', 'paid'])) {
+        // 2. Sync Payment Status for online-payment statuses
+        if (in_array($new_status, ['paid', 'shipped', 'out_for_delivery', 'delivered'])) {
             $stmtPay = $pdo->prepare("UPDATE orders SET payment_status = 'paid' WHERE id = ?");
             $stmtPay->execute([$order_id]);
 
-            // Sync Items: Update all non-cancelled items to match order status
-            // This allows the "Quick Update" from the table to work as a bulk action
+            // Cascade item status for fulfilment statuses
+            $item_status_to_set = $new_status; // e.g. shipped, out_for_delivery, delivered
             $stmtItems = $pdo->prepare("UPDATE order_items SET status = ? WHERE order_id = ? AND status != 'cancelled'");
-            $stmtItems->execute([$new_status, $order_id]);
+            $stmtItems->execute([$item_status_to_set, $order_id]);
         }
 
-        // 3. Sync Item Status: If order is cancelled (either via 'cancelled' or 'refund_processing'), all items are cancelled
+        // 3. Cancel all items if order is cancelled
         if (isset($is_cancelled_action) && $is_cancelled_action) {
             $stmtItems = $pdo->prepare("UPDATE order_items SET status = 'cancelled' WHERE order_id = ? AND status != 'cancelled'");
             $stmtItems->execute([$order_id]);
         }
 
+        // If tracking note provided, save it too
+        if (!empty($_POST['tracking_note'])) {
+            $trackStmt = $pdo->prepare("UPDATE orders SET tracking_note = ? WHERE id = ?");
+            $trackStmt->execute([trim($_POST['tracking_note']), $order_id]);
+        }
+
         $pdo->commit();
 
-        // Preserve filter/view params
         $redirect_url = "index.php?order_updated=1";
-        if (isset($_GET['status']))
-            $redirect_url .= "&status=" . $_GET['status'];
-        if (isset($_GET['view']))
-            $redirect_url .= "&view=" . $_GET['view'];
+        if (isset($_GET['status'])) $redirect_url .= "&status=" . urlencode($_GET['status']);
+        if (isset($_GET['view']))   $redirect_url .= "&view="   . urlencode($_GET['view']);
 
         header("Location: " . $redirect_url);
         exit();
     } catch (PDOException $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
+        if ($pdo->inTransaction()) $pdo->rollBack();
         $error = "Error updating order status: " . $e->getMessage();
     }
+    } // end allowed check
 }
 
 // Handle Delete Order
@@ -235,12 +246,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['update_item_status']))
         $active_shipped_or_delivered_count = 0;
         $any_shipped_delivered = false;
 
+        $fulfil_statuses = ['shipped', 'out_for_delivery', 'delivered'];
+
         foreach ($all_items as $status) {
             if ($status != 'cancelled') {
                 $all_cancelled = false;
                 $active_item_count++;
 
-                if ($status == 'delivered' || $status == 'shipped') {
+                if (in_array($status, $fulfil_statuses)) {
                     $active_shipped_or_delivered_count++;
                     $any_shipped_delivered = true;
                 }
@@ -257,15 +270,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['update_item_status']))
             $stmtOrder = $pdo->prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?");
             $stmtOrder->execute([$order_id]);
         } elseif ($all_delivered && $active_item_count > 0) {
-            // If all active items are DELIVERED
-            $stmtOrder = $pdo->prepare("UPDATE orders SET status = 'delivered', payment_status = 'paid' WHERE id = ?");
+            // All active items delivered → order is DELIVERED
+            $stmtOrder = $pdo->prepare("UPDATE orders SET status = 'delivered', payment_status = 'paid', delivered_at = NOW() WHERE id = ?");
             $stmtOrder->execute([$order_id]);
         } elseif ($active_shipped_or_delivered_count == $active_item_count && $active_item_count > 0) {
-            // If all active items are SHIPPED (or Delivered) -> Order is SHIPPED
-            $stmtOrder = $pdo->prepare("UPDATE orders SET status = 'shipped', payment_status = 'paid' WHERE id = ?");
+            // All active items dispatched → order is SHIPPED
+            $stmtOrder = $pdo->prepare("UPDATE orders SET status = 'shipped', payment_status = 'paid', shipped_at = COALESCE(shipped_at, NOW()) WHERE id = ?");
             $stmtOrder->execute([$order_id]);
         } elseif ($any_shipped_delivered) {
-            // Partial shipment or just started -> Ensure Paid
+            // Partial — ensure payment confirmed
             $stmtOrder = $pdo->prepare("UPDATE orders SET payment_status = 'paid' WHERE id = ?");
             $stmtOrder->execute([$order_id]);
         }
@@ -287,10 +300,28 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['update_item_status']))
     }
 }
 
+// \u2500\u2500 Auto-migrate: silently add new columns if they don't exist \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+$_migrations = [
+    "ALTER TABLE orders ADD COLUMN payment_method  VARCHAR(50)    DEFAULT 'cod'",
+    "ALTER TABLE orders ADD COLUMN payment_status  ENUM('paid','unpaid') DEFAULT 'unpaid'",
+    "ALTER TABLE orders ADD COLUMN shipping_name   VARCHAR(100)   NULL",
+    "ALTER TABLE orders ADD COLUMN shipping_phone  VARCHAR(20)    NULL",
+    "ALTER TABLE orders ADD COLUMN shipping_address TEXT          NULL",
+    "ALTER TABLE orders ADD COLUMN shipped_at      DATETIME       NULL",
+    "ALTER TABLE orders ADD COLUMN delivered_at    DATETIME       NULL",
+    "ALTER TABLE orders ADD COLUMN tracking_note   VARCHAR(255)   NULL",
+    "ALTER TABLE orders  MODIFY COLUMN status ENUM('pending','paid','unpaid','shipped','out_for_delivery','delivered','cancelled') DEFAULT 'pending'",
+    "ALTER TABLE order_items MODIFY COLUMN status ENUM('pending','shipped','out_for_delivery','delivered','cancelled') DEFAULT 'pending'",
+];
+foreach ($_migrations as $_sql) {
+    try { $pdo->exec($_sql); } catch (PDOException $_e) { /* column already exists — ignore */ }
+}
+
 // 1. Fetch Stats
 // Total Orders
 $stmt = $pdo->query("SELECT COUNT(*) FROM orders");
 $total_orders = $stmt->fetchColumn();
+
 
 // Unpaid Orders
 // Status is 'unpaid' AND NOT (all items cancelled) (Partial cancel still unpaid or partially paid? usually unpaid is whole or nothing. Let's keep logic simple: unpaid + items active).
@@ -302,11 +333,10 @@ $stmt = $pdo->query("
 ");
 $unpaid_orders = $stmt->fetchColumn();
 
-// Paid Orders
-// Status is 'paid', 'shipped', or 'delivered' AND (at least ONE item is NOT cancelled)
+// Paid Orders — includes all fulfilment statuses
 $stmt = $pdo->query("
     SELECT COUNT(*) FROM orders o 
-    WHERE o.status IN ('paid', 'shipped', 'delivered') 
+    WHERE o.status IN ('paid', 'shipped', 'out_for_delivery', 'delivered') 
     AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id AND oi.status != 'cancelled')
 ");
 $paid_orders = $stmt->fetchColumn();
@@ -333,8 +363,8 @@ $params = [];
 if ($filter_status == 'unpaid') {
     $where_sql = "WHERE (o.status = 'unpaid' OR o.status = 'pending')";
 } elseif ($filter_status == 'paid') {
-    // Show only fully paid, shipped, or delivered (exclude fully cancelled)
-    $where_sql = "WHERE o.status IN ('paid', 'shipped', 'delivered') AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id AND oi.status != 'cancelled')";
+    // Show paid, shipped, out_for_delivery, delivered (active orders with payment confirmed)
+    $where_sql = "WHERE o.status IN ('paid', 'shipped', 'out_for_delivery', 'delivered') AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id AND oi.status != 'cancelled')";
 } elseif ($filter_status == 'cancelled') {
     // Show orders that are fully cancelled OR have ANY cancelled items
     $where_sql = "WHERE (o.status = 'cancelled' OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id AND oi.status = 'cancelled'))";
@@ -343,7 +373,9 @@ if ($filter_status == 'unpaid') {
 // Recent Orders (Ungrouped - Individual Orders)
 $pdo->exec("SET SESSION group_concat_max_len = 100000"); // Increase limit to prevent truncation
 $sql = "
-    SELECT o.id as order_id, o.customer_id, o.total_amount, TRIM(o.status) as status, o.created_at, TRIM(o.payment_status) as payment_status, o.shipping_address, o.shipping_name, o.shipping_phone,
+    SELECT o.id as order_id, o.customer_id, o.total_amount, TRIM(o.status) as status, o.created_at,
+    TRIM(o.payment_status) as payment_status, o.payment_method, o.shipping_address, o.shipping_name, o.shipping_phone,
+    o.shipped_at, o.delivered_at, COALESCE(o.tracking_note, '') as tracking_note,
     c.name as customer_name, c.email as customer_email,
     GROUP_CONCAT(CONCAT(p.name, '::', oi.quantity, '::', p.image, '::', p.price, '::', REPLACE(REPLACE(COALESCE(p.description, 'No description'), '::', ' '), '||', ' '), '::', p.category, '::', oi.status, '::', oi.id) SEPARATOR '||') as product_details
     FROM orders o 
@@ -762,7 +794,7 @@ $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                         <th>Customer</th>
                                         <th>Products</th>
                                         <th>Total (₹)</th>
-                                        <th>Status</th>
+                                        <th>Status <small class="text-muted fw-normal">(click to change)</small></th>
                                         <th>Date</th>
                                         <th>Action</th>
                                     </tr>
@@ -851,12 +883,34 @@ $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                             <td>₹<?= number_format($o['total_amount'], 2) ?>
                                             </td>
                                             <td>
-                                                <?php if ($o['status'] == 'paid' || $o['status'] == 'shipped' || $o['status'] == 'delivered'): ?>
-                                                    <span class="badge bg-success" style="width: 100px;">Paid</span>
-                                                <?php else: ?>
-                                                    <span class="badge bg-warning text-dark" style="width: 100px;">Unpaid</span>
-                                                <?php endif; ?>
+                                                <?php
+                                                $cur_status = strtolower(trim($o['status']));
+                                                // Determine dropdown color class
+                                                $sel_class = 'bg-warning text-dark'; // default: pending
+                                                if (in_array($cur_status, ['paid']))                    $sel_class = 'bg-success text-white';
+                                                elseif (in_array($cur_status, ['shipped']))             $sel_class = 'bg-info text-dark';
+                                                elseif (in_array($cur_status, ['out_for_delivery']))    $sel_class = 'bg-primary text-white';
+                                                elseif (in_array($cur_status, ['delivered']))           $sel_class = 'bg-success text-white';
+                                                elseif (in_array($cur_status, ['cancelled']))           $sel_class = 'bg-danger text-white';
+                                                ?>
+                                                <form method="POST" style="min-width:160px;">
+                                                    <input type="hidden" name="update_order_status" value="1">
+                                                    <input type="hidden" name="order_id" value="<?= $o['order_id'] ?>">
+                                                    <select name="new_status"
+                                                        onchange="this.form.submit()"
+                                                        class="form-select form-select-sm fw-bold border-0 rounded-pill px-2 <?= $sel_class ?>"
+                                                        style="font-size:0.78rem; cursor:pointer;">
+                                                        <option value="pending"           <?= $cur_status == 'pending'           ? 'selected' : '' ?>>⏳ Pending</option>
+                                                        <option value="paid"              <?= $cur_status == 'paid'              ? 'selected' : '' ?>>✅ Paid</option>
+                                                        <option value="shipped"           <?= $cur_status == 'shipped'           ? 'selected' : '' ?>>🚚 Shipped</option>
+                                                        <option value="out_for_delivery"  <?= $cur_status == 'out_for_delivery'  ? 'selected' : '' ?>>🚴 Out for Delivery</option>
+                                                        <option value="delivered"         <?= $cur_status == 'delivered'         ? 'selected' : '' ?>>🏠 Delivered</option>
+                                                        <option value="cancelled"         <?= $cur_status == 'cancelled'         ? 'selected' : '' ?>>❌ Cancelled</option>
+                                                        <option value="refund_processing" <?= ($cur_status == 'cancelled' && ($o['payment_status'] ?? '') == 'paid') ? 'selected' : '' ?>>💸 Refund</option>
+                                                    </select>
+                                                </form>
                                             </td>
+
                                             <td><?= date('M d, H:i', strtotime($o['created_at'])) ?>
                                             </td>
                                             <td>
@@ -1253,6 +1307,32 @@ $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
                             </div>
                         </div>
 
+                        <!-- ── Admin Status Update Panel ─────────────────────── -->
+                        <div class="mt-4 pt-3 border-top">
+                            <h6 class="fw-bold mb-3 text-muted text-uppercase" style="font-size:0.78rem;letter-spacing:1px;">Update Order Status</h6>
+                            <form method="POST" id="adminStatusForm" class="d-flex gap-2 flex-wrap align-items-end">
+                                <input type="hidden" name="update_order_status" value="1">
+                                <input type="hidden" name="order_id" id="modalStatusOrderId">
+                                <div class="flex-grow-1">
+                                    <label class="form-label small fw-bold text-muted mb-1">Status</label>
+                                    <select name="new_status" id="modalStatusSelect" class="form-select form-select-sm">
+                                        <option value="pending">⏳ Pending (COD - Not Yet Paid)</option>
+                                        <option value="paid">✅ Paid (Online / COD Verified)</option>
+                                        <option value="shipped">🚚 Shipped</option>
+                                        <option value="out_for_delivery">🚴 Out for Delivery</option>
+                                        <option value="delivered">🏠 Delivered</option>
+                                        <option value="cancelled">❌ Cancelled (Unpaid)</option>
+                                        <option value="refund_processing">💸 Refund Processing (Was Paid)</option>
+                                    </select>
+                                </div>
+                                <div class="flex-grow-1">
+                                    <label class="form-label small fw-bold text-muted mb-1">Tracking Note <span class="text-muted fw-normal">(optional)</span></label>
+                                    <input type="text" name="tracking_note" id="modalTrackingNote" class="form-control form-control-sm" placeholder="e.g. Package dispatched from Mumbai hub">
+                                </div>
+                                <button type="submit" class="btn btn-sm btn-primary px-3 fw-bold">Update</button>
+                            </form>
+                        </div>
+
                     </div>
                 </div>
             </div>
@@ -1517,6 +1597,18 @@ $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 document.getElementById('modalCustPhone').innerText = order.shipping_phone || order.shipping_phone;
                 document.getElementById('modalCustAddress').innerText = order.shipping_address;
 
+                // Populate status update form
+                document.getElementById('modalStatusOrderId').value = order.order_id;
+                const statusSelect = document.getElementById('modalStatusSelect');
+                const currentStatus = (order.status || 'pending').trim().toLowerCase();
+                // Map refund_processing (display) back to value
+                const selectVal = currentStatus === 'cancelled' && order.payment_status === 'paid' ? 'refund_processing' : currentStatus;
+                for (let opt of statusSelect.options) {
+                    opt.selected = (opt.value === selectVal);
+                }
+                // Reset tracking note
+                document.getElementById('modalTrackingNote').value = order.tracking_note || '';
+
                 // Parse custom delimiter string: Name::Qty::Image::Price::Desc::Category || ...
                 var itemsHtml = '<ul class="list-group list-group-flush">';
                 var firstItemData = null;
@@ -1572,6 +1664,8 @@ $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
                             var badgeClass = 'bg-secondary';
                             if (itemStatus === 'delivered' || itemStatus === 'paid') badgeClass = 'bg-success';
                             else if (itemStatus === 'shipped') badgeClass = 'bg-info';
+                            else if (itemStatus === 'out_for_delivery') badgeClass = 'bg-warning text-dark';
+                            else if (itemStatus === 'pending') badgeClass = 'bg-secondary';
 
                             itemsHtml += `
                         <li class="list-group-item d-flex align-items-center gap-3 px-0 p-2 border rounded mb-2" 
